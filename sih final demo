@@ -1,0 +1,227 @@
+import cv2
+import random
+import streamlit as st
+from ultralytics import YOLO
+from streamlit_autorefresh import st_autorefresh
+import torch
+from concurrent.futures import ThreadPoolExecutor
+
+# -----------------------------
+# Streamlit Page Config
+# -----------------------------
+st.set_page_config(page_title="Smart Traffic Management", layout="wide")
+st.title("🚦 Smart Traffic Management System")
+st_autorefresh(interval=500, key="video_refresh")  # refresh every 0.5 sec
+
+# -----------------------------
+# Enable GPU if available
+# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    st.sidebar.success(f"GPU Enabled ✅ ({torch.cuda.get_device_name(0)})")
+else:
+    st.sidebar.info("Running on CPU")
+
+# -----------------------------
+# Load YOLOv5 model on selected device
+# -----------------------------
+model = YOLO("yolov5s.pt").to(device)
+
+# -----------------------------
+# Video sources
+# -----------------------------
+video_paths = [
+    r"C:\Users\HP\OneDrive\Desktop\sih\WhatsApp Video 2025-09-13 at 09.51.56_470528c0.mp4",
+    r"C:\Users\HP\OneDrive\Desktop\sih\WhatsApp Video 2025-09-16 at 12.27.13_520b86cf.mp4"
+]
+caps = [cv2.VideoCapture(v) for v in video_paths]
+
+# -----------------------------
+# User Authentication
+# -----------------------------
+credentials = {
+    "authority_user": "password123",
+    "normal_user": "userpass"
+}
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = None
+
+if st.session_state.authenticated is None:
+    st.sidebar.subheader("Login")
+    username = st.sidebar.text_input("Username")
+    password = st.sidebar.text_input("Password", type="password")
+    if st.sidebar.button("Login"):
+        if username in credentials and credentials[username] == credentials[username]:
+            st.session_state.authenticated = username
+        else:
+            st.sidebar.error("Invalid credentials")
+    st.stop()
+
+# Determine role automatically
+user_role = "authority" if st.session_state.authenticated == "authority_user" else "user"
+
+# -----------------------------
+# Vehicle classes & metrics
+# -----------------------------
+vehicle_names = ["car", "motorbike", "bus", "truck"]
+vehicle_emission = {"car":0.34, "motorbike":0.15, "bus":1.0, "truck":1.5}
+BOTTLENECK_THRESHOLD = 25
+
+# -----------------------------
+# Session State Initialization
+# -----------------------------
+if "frame_index" not in st.session_state:
+    st.session_state.frame_index = [0]*len(video_paths)
+if "waiting_times" not in st.session_state:
+    st.session_state.waiting_times = [0]*len(video_paths)
+if "current_green" not in st.session_state:
+    st.session_state.current_green = [20]*len(video_paths)
+if "last_results" not in st.session_state:
+    st.session_state.last_results = [None]*len(video_paths)
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+def get_density_label(count):
+    if count < 10: return "Low Traffic"
+    elif 10 <= count < 25: return "Medium Traffic"
+    else: return "High Traffic"
+
+# -----------------------------
+# Parallel Video Processing Function
+# -----------------------------
+def process_video(idx, cap, frame_indices, waiting_times, current_greens, last_results):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[idx])
+    ret, frame = cap.read()
+    frame_indices[idx] += 1
+    if not ret:
+        frame_indices[idx] = 0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = cap.read()
+    if not ret:
+        return None, frame_indices[idx], waiting_times[idx], current_greens[idx], last_results[idx]
+
+    frame_resized = cv2.resize(frame, (640,360))
+    run_detection = (frame_indices[idx] % 3 == 0)
+
+    if run_detection:
+        results = model(frame_resized, verbose=False)
+        last_results[idx] = results
+    else:
+        results = last_results[idx]
+
+    # Initialize metrics
+    vehicle_count = 0
+    co2_reduction = 0
+
+    # Process detections
+    if results is not None:
+        detections = results[0].boxes.data.cpu().numpy()
+        class_ids = results[0].boxes.cls.cpu().numpy()
+        for det, cls_id in zip(detections, class_ids):
+            cls_id = int(cls_id)
+            cls_name = model.names[cls_id].lower()
+            if cls_name in vehicle_names:
+                vehicle_count += 1
+                x1, y1, x2, y2, conf = map(int, det[:5])
+                h_ratio = frame.shape[0]/360
+                w_ratio = frame.shape[1]/640
+                x1, y1, x2, y2 = int(x1*w_ratio), int(y1*h_ratio), int(x2*w_ratio), int(y2*h_ratio)
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+                cv2.putText(frame,f"{cls_name} {conf:.2f}",(x1,y1-5),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+
+                # Update waiting times & green signal
+                if vehicle_count > 0:
+                    waiting_times[idx] += random.randint(2,5)
+                else:
+                    waiting_times[idx] = max(0, waiting_times[idx]-3)
+                waiting_times[idx] = min(waiting_times[idx],50)
+
+                base_time = 20
+                alpha = 1
+                beta = 0.5
+                target_green = base_time + alpha*vehicle_count + beta*waiting_times[idx]
+                target_green = max(20, min(int(target_green),90))
+                smoothed = current_greens[idx] + 0.2*(target_green-current_greens[idx])
+                current_greens[idx] = smoothed
+
+                time_saved_ratio = max(0,(int(smoothed)-20)/int(smoothed))
+                co2_reduction += vehicle_emission[cls_name]*time_saved_ratio
+
+    co2_reduction = round(co2_reduction,2)
+    density_status = get_density_label(vehicle_count)
+    signal_time = int(current_greens[idx])
+    waiting_time = waiting_times[idx]
+    bottleneck = "Yes" if vehicle_count >= BOTTLENECK_THRESHOLD else "No"
+
+    # Red overlay for authority view
+    if bottleneck=="Yes" and user_role=="authority":
+        overlay = frame.copy()
+        cv2.rectangle(overlay,(0,0),(frame.shape[1],frame.shape[0]),(0,0,255),-1)
+        cv2.addWeighted(overlay,0.3,frame,0.7,0,frame)
+
+    return {
+        "frame": frame,
+        "vehicle_count": vehicle_count,
+        "density_status": density_status,
+        "signal_time": signal_time,
+        "waiting_time": waiting_time,
+        "co2_reduction": co2_reduction,
+        "bottleneck": bottleneck
+    }, frame_indices[idx], waiting_times[idx], current_greens[idx], last_results[idx]
+
+# -----------------------------
+# Copy session state to local lists for thread safety
+# -----------------------------
+frame_indices = st.session_state.frame_index.copy()
+waiting_times = st.session_state.waiting_times.copy()
+current_greens = st.session_state.current_green.copy()
+last_results = st.session_state.last_results.copy()
+
+# -----------------------------
+# Parallel Processing
+# -----------------------------
+frames_col = st.columns(len(caps))
+bottleneck_list = []
+
+with ThreadPoolExecutor(max_workers=len(caps)) as executor:
+    futures = [executor.submit(process_video, idx, cap, frame_indices, waiting_times, current_greens, last_results)
+               for idx, cap in enumerate(caps)]
+    results_list = [f.result() for f in futures]
+
+# -----------------------------
+# Update session_state after threads
+# -----------------------------
+for idx, (res, f_idx, w_time, c_green, l_res) in enumerate(results_list):
+    st.session_state.frame_index[idx] = f_idx
+    st.session_state.waiting_times[idx] = w_time
+    st.session_state.current_green[idx] = c_green
+    st.session_state.last_results[idx] = l_res
+
+    if res is None:
+        continue
+
+    bottleneck_list.append(res["bottleneck"])
+    with frames_col[idx]:
+        st.subheader(f"📷 Video Source {idx+1}")
+        st.image(res["frame"], channels="BGR", use_container_width=True)
+        st.metric("🚗 Vehicles", res["vehicle_count"])
+        st.metric("🔴 Traffic Status", res["density_status"])
+        st.metric("⏱️ Green Signal (s)", res["signal_time"])
+        st.metric("⌛ Avg Waiting Time (s)", res["waiting_time"])
+        st.metric("🌱 CO2 Reduction (kg/hr)", res["co2_reduction"])
+        st.metric("⚠️ Bottleneck", res["bottleneck"])
+
+# -----------------------------
+# Sidebar Summary
+# -----------------------------
+active_bottlenecks = bottleneck_list.count("Yes")
+st.sidebar.title("Traffic Summary")
+st.sidebar.metric("⚠️ Active Bottlenecks", active_bottlenecks)
+
+# Authority controls
+if user_role=="authority":
+    st.sidebar.subheader("Authority Controls")
+    BOTTLENECK_THRESHOLD = st.sidebar.slider("Bottleneck Vehicle Threshold", 10, 50, BOTTLENECK_THRESHOLD)
